@@ -1,0 +1,178 @@
+#!/usr/bin/env expect -f
+# Gemma + Ollama REPL with quiet boot -> auto interactive, filtered listing, /cat, /cat!, /purpose, /mute, /unmute
+
+# ======= CONFIG =======
+set timeout -1
+set model "gemma3:4b"
+set maxdepth 6
+set maxlines 200
+
+# Allowed roots to browse
+set allowed_dirs {
+  "/Users/seanbenson/SaltStackAltDoor"
+  "/Users/seanbenson/AIfiles"
+}
+
+# Exclude these dirs from recursive listings
+set exclude_dirs {.git pki .ssh node_modules venv .venv .tox .mypy_cache __pycache__ .idea .vscode}
+
+# Sensitive file patterns (blocked by default in /cat)
+set sensitive_exts {pem key crt p12 pfx kdb kdbx sqlite db env secret secrets json.asc gpg asc}
+set sensitive_subpaths {/.git/ /pki/ /.ssh/ /secrets/ /credentials/}
+
+# System modes
+set system_rule_quiet "BOOT MODE: Remain silent. Do not ask questions. Do not generate explanations. Reply ONLY with the exact token: READY."
+set system_rule_work  "WORK MODE: You are code. No apologies, no self-references, no emotions, no compliments. Do NOT invent files or paths. Only reference items the user provides. Do NOT attempt to read files yourself; the user will use helper commands. Be concise and precise. If content is required, ask the user to provide it with /cat."
+
+# Project purpose (persistent context)
+set project_purpose "The purpose of this project is to maintain remote recovery access to Salt minions that have stopped communicating with the Salt master. Because these minions are behind firewalls and cannot be reached via SSH directly, each minion checks a webserver every five minutes for an updated index.html. If the index.html contains its own base64-encoded minion_id (matching /etc/salt/minion_id), the minion recognizes it has been flagged for recovery and automatically spins up an SSH tunnel to a central SSH server. This allows the operator to connect via localhost on a provided port and troubleshoot why the minion is not communicating with the master."
+
+# ======= HELPERS =======
+proc normalize {p} {
+  if {[file exists $p]} { return [file normalize $p] }
+  set dir [file dirname $p]; set base [file tail $p]
+  if {[file exists $dir]} { return "[file normalize $dir]/$base" }
+  return $p
+}
+proc in_allowed {path dirs} {
+  set np [normalize $path]
+  foreach d $dirs { if {[string match "[file normalize $d]*" $np]} { return 1 } }
+  return 0
+}
+proc is_regular_file {p} { expr {[file exists $p] && [file isfile $p]} }
+proc is_probably_binary {p} {
+  set script "LC_ALL=C head -c 2048 -- \"$p\" | LC_ALL=C grep -q \"\\x00\" && echo BIN || echo TEXT"
+  set kind [string trim [exec /bin/sh -c $script]]
+  expr {$kind eq "BIN"}
+}
+proc file_ext {p} {
+  set base [file tail $p]
+  if {[regexp {\.([^.]+)$} $base -> ext]} { return [string tolower $ext] }
+  return ""
+}
+proc has_sensitive_ext {p exts} {
+  set ext [file_ext $p]
+  foreach e $exts { if {[string equal -nocase $ext $e]} { return 1 } }
+  return 0
+}
+proc has_sensitive_subpath {p subs} {
+  foreach s $subs { if {[string first $s $p] >= 0} { return 1 } }
+  return 0
+}
+proc is_sensitive_file {p exts subs} { expr {[has_sensitive_ext $p $exts] || [has_sensitive_subpath $p $subs]} }
+proc cat_range {path start end} {
+  set cmd [format {sed -n '%d,%dp' -- "%s"} $start $end $path]
+  return [exec /bin/sh -c $cmd]
+}
+proc build_find_cmd {root maxdepth exclude_dirs} {
+  set cmd "find \"${root}\" -maxdepth ${maxdepth} -type f"
+  foreach ed $exclude_dirs { append cmd " ! -path \"*/$ed/*\"" }
+  append cmd " -print"
+  return $cmd
+}
+proc build_listing {dirs maxdepth exclude_dirs} {
+  set out ""
+  foreach d $dirs {
+    if {[file isdirectory $d]} {
+      append out "$d (recursive):\n"
+      set cmd [list /bin/sh -c "[build_find_cmd $d $maxdepth $exclude_dirs] | sed 's/^/  /'"]
+      append out [exec {*}$cmd]
+      append out "\n\n"
+    } else {
+      append out "$d: [Directory not found]\n\n"
+    }
+  }
+  return $out
+}
+
+# ======= INITIALIZE =======
+set listing [build_listing $allowed_dirs $maxdepth $exclude_dirs]
+
+# Start REPL
+spawn ollama run $model
+after 600
+
+# 1) Enter QUIET boot mode (expects only READY)
+send -- "/set system {$system_rule_quiet}\r"
+after 200
+
+# Inject context in fenced blocks; instruct to reply only READY once
+set payload "Authoritative file list (sensitive dirs filtered):\n```text\n$listing\n```\nProject Purpose:\n$project_purpose\nReply ONLY with: READY"
+send -- "$payload\r"
+
+# Wait for exactly one READY, then switch to WORK mode automatically
+expect {
+  -re {READY} {}
+  timeout { }
+}
+
+# 2) Switch to WORK mode so normal answers resume
+send -- "/set system {$system_rule_work}\r"
+
+# ======= SINGLE INTERACT LOOP =======
+# Commands:
+#   /refresh                 -> rebuild listing
+#   /cat PATH[:start-end]    -> safe view (blocks sensitive)
+#   /cat! PATH[:start-end]   -> force view text (still blocks binary)
+#   /purpose                 -> show current purpose
+#   /purpose remind          -> send purpose to model (WORK mode)
+#   /purpose set <text>      -> update + send new purpose (WORK mode)
+#   /mute                    -> switch back to QUIET boot mode (future: reply READY)
+#   /unmute                  -> switch to WORK mode (normal answers)
+interact \
+  -re {^/refresh\r$} {
+    send_user "\n[Refreshing listing...]\n"
+    set listing [build_listing $allowed_dirs $maxdepth $exclude_dirs]
+    send -- "Updated authoritative file list:\n```text\n$listing\n```\r"
+  } \
+  -re {^/cat![ \t]+(.+)\r$} {
+    set arg $interact_out(1,string)
+    set path $arg; set start 1; set end $maxlines
+    if {[regexp {^(.*):([0-9]+)-([0-9]+)$} $arg -> p s e]} { set path $p; set start $s; set end $e
+      if {$start < 1} { set start 1 }; if {$end < $start} { set end $start }
+      if {$end - $start > 5000} { set end [expr {$start + 5000}] } }
+    set npath [normalize $path]
+    if {![in_allowed $npath $allowed_dirs]} { send -- "Denied: path not within allowed directories.\r"; return }
+    if {![is_regular_file $npath]} { send -- "Not a regular file or does not exist: $npath\r"; return }
+    if {[is_probably_binary $npath]} { send -- "Binary file detected; not displaying. (path: $npath)\r"; return }
+    if {[catch {set content [cat_range $npath $start $end]} err]} { send -- "Read error: $err\r" } else {
+      send -- "----- BEGIN $npath ($start-$end) [FORCED] -----\n$content\n----- END $npath -----\r"
+    }
+  } \
+  -re {^/cat[ \t]+(.+)\r$} {
+    set arg $interact_out(1,string)
+    set path $arg; set start 1; set end $maxlines
+    if {[regexp {^(.*):([0-9]+)-([0-9]+)$} $arg -> p s e]} { set path $p; set start $s; set end $e
+      if {$start < 1} { set start 1 }; if {$end < $start} { set end $start }
+      if {$end - $start > 5000} { set end [expr {$start + 5000}] } }
+    set npath [normalize $path]
+    if {![in_allowed $npath $allowed_dirs]} { send -- "Denied: path not within allowed directories.\r"; return }
+    if {![is_regular_file $npath]} { send -- "Not a regular file or does not exist: $npath\r"; return }
+    if {[is_sensitive_file $npath $sensitive_exts $sensitive_subpaths]} {
+      send -- "Blocked sensitive file: $npath  (use /cat! to force view)\r"; return
+    }
+    if {[is_probably_binary $npath]} { send -- "Binary file detected; not displaying. (path: $npath)\r"; return }
+    if {[catch {set content [cat_range $npath $start $end]} err]} { send -- "Read error: $err\r" } else {
+      send -- "----- BEGIN $npath ($start-$end) -----\n$content\n----- END $npath -----\r"
+    }
+  } \
+  -re {^/purpose\r$} {
+    send -- "Project Purpose (current):\n$project_purpose\r"
+  } \
+  -re {^/purpose[ \t]+remind\r$} {
+    send -- "Project Purpose:\n$project_purpose\r"
+  } \
+  -re {^/purpose[ \t]+set[ \t]+(.+)\r$} {
+    set newtxt $interact_out(1,string)
+    set project_purpose $newtxt
+    send -- "Project Purpose updated.\r"
+    send -- "Project Purpose:\n$project_purpose\r"
+  } \
+  -re {^/mute\r$} {
+    send -- "/set system {$system_rule_quiet}\r"
+    send -- "Reply ONLY with READY until /unmute.\r"
+  } \
+  -re {^/unmute\r$} {
+    send -- "/set system {$system_rule_work}\r"
+    send -- "Interactive mode restored.\r"
+  }
